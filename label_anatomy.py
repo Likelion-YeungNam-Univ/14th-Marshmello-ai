@@ -11,6 +11,8 @@ from davey_score import (
     load_navel_points,
     save_abdomen_rois,
     save_navel_points,
+)
+from label_ui import (
     select_abdomen_polygon_interactively,
     select_navel_interactively,
 )

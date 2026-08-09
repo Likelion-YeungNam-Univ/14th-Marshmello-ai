@@ -19,7 +19,15 @@ from davey_score import (
 )
 from input_validator import InputStatus, draw_validation_overlay, validate_input_image
 from locator_core import create_locator_model, predict_anatomy
-from locator_settings import ABDOMEN_THRESHOLD, LOCATOR_CHECKPOINT_PATH
+from locator_settings import (
+    ABDOMEN_THRESHOLD,
+    LOCATOR_CHECKPOINT_PATH,
+    LOCATOR_VERSION,
+    MIN_ABDOMEN_CORE_WIDTH_RATIO_REVIEW,
+    MIN_ABDOMEN_SOLIDITY_REVIEW,
+    MIN_NAVEL_BOUNDARY_MARGIN_RATIO_REVIEW,
+    NAVEL_TARGET_TYPE,
+)
 from semantic_validator import (
     SemanticInputValidator,
     SemanticStatus,
@@ -46,6 +54,15 @@ SUMMARY_FIELDS = [
     "navel_confidence",
     "abdomen_confidence",
     "abdomen_area_ratio",
+    "abdomen_solidity",
+    "abdomen_extent",
+    "abdomen_core_width_ratio",
+    "abdomen_component_count",
+    "navel_boundary_margin_ratio",
+    "navel_heatmap_concentration",
+    "navel_heatmap_spread_ratio",
+    "navel_candidate_area_ratio",
+    "navel_candidate_component_count",
     "brightness_mean",
     "contrast_std",
     "left_upper_count",
@@ -118,6 +135,26 @@ def semantic_output_fields(
     }
 
 
+def validation_summary_fields(validation) -> dict[str, object]:
+    def rounded(value, digits=6):
+        return None if value is None else round(value, digits)
+
+    return {
+        "abdomen_area_ratio": round(validation.abdomen_area_ratio, 6),
+        "abdomen_solidity": rounded(validation.abdomen_solidity),
+        "abdomen_extent": rounded(validation.abdomen_extent),
+        "abdomen_core_width_ratio": rounded(validation.abdomen_core_width_ratio),
+        "abdomen_component_count": validation.abdomen_component_count,
+        "navel_boundary_margin_ratio": rounded(validation.navel_boundary_margin_ratio),
+        "navel_heatmap_concentration": rounded(validation.navel_heatmap_concentration),
+        "navel_heatmap_spread_ratio": rounded(validation.navel_heatmap_spread_ratio),
+        "navel_candidate_area_ratio": rounded(validation.navel_candidate_area_ratio),
+        "navel_candidate_component_count": validation.navel_candidate_component_count,
+        "brightness_mean": round(validation.brightness_mean, 3),
+        "contrast_std": round(validation.contrast_std, 3),
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
@@ -167,6 +204,32 @@ def main() -> None:
     parser.add_argument("--maximum-brightness", type=float, default=242.0)
     parser.add_argument("--minimum-contrast-std", type=float, default=8.0)
     parser.add_argument("--navel-edge-margin-ratio", type=float, default=0.04)
+    parser.add_argument(
+        "--minimum-abdomen-solidity-review",
+        type=float,
+        default=MIN_ABDOMEN_SOLIDITY_REVIEW,
+        help="복부 mask solidity가 이 값보다 낮으면 review 처리합니다.",
+    )
+    parser.add_argument(
+        "--minimum-abdomen-core-width-ratio-review",
+        type=float,
+        default=MIN_ABDOMEN_CORE_WIDTH_RATIO_REVIEW,
+        help="복부 mask 중앙 폭 비율이 이 값보다 낮으면 review 처리합니다.",
+    )
+    parser.add_argument(
+        "--minimum-navel-boundary-margin-ratio-review",
+        type=float,
+        default=MIN_NAVEL_BOUNDARY_MARGIN_RATIO_REVIEW,
+        help="배꼽과 복부 외곽선 사이 여유가 이 값보다 작으면 review 처리합니다.",
+    )
+    parser.add_argument(
+        "--allow-legacy-locator",
+        action="store_true",
+        help=(
+            "구형 원형-mask locator checkpoint를 테스트 목적으로 허용합니다. "
+            "운영에서는 locator v2 재학습 checkpoint 사용을 권장합니다."
+        ),
+    )
     parser.add_argument(
         "--allow-review-scoring",
         action="store_true",
@@ -263,6 +326,21 @@ def main() -> None:
         map_location=device,
         weights_only=False,
     )
+    locator_is_v2 = (
+        int(locator_checkpoint.get("locator_version", 0)) >= LOCATOR_VERSION
+        and str(locator_checkpoint.get("navel_target_type", "")) == NAVEL_TARGET_TYPE
+    )
+    if not locator_is_v2:
+        message = (
+            "현재 locator checkpoint는 Gaussian heatmap 기반 locator v2가 아닙니다.\n"
+            "다음을 실행해 locator를 재학습하세요:\n"
+            "  python prepare_locator_dataset.py --overwrite\n"
+            "  python train_locator.py"
+        )
+        if not args.allow_legacy_locator:
+            raise RuntimeError(message)
+        print("WARNING: " + message.replace("\n", " | "))
+
     locator_image_size = int(locator_checkpoint.get("image_size", 512))
     locator_encoder = str(locator_checkpoint.get("encoder_name", "resnet34"))
     locator_model = create_locator_model(
@@ -432,6 +510,13 @@ def main() -> None:
             maximum_brightness=args.maximum_brightness,
             minimum_contrast_std=max(0.0, args.minimum_contrast_std),
             navel_edge_margin_ratio=max(0.0, args.navel_edge_margin_ratio),
+            minimum_abdomen_solidity_review=max(0.0, args.minimum_abdomen_solidity_review),
+            minimum_abdomen_core_width_ratio_review=max(
+                0.0, args.minimum_abdomen_core_width_ratio_review
+            ),
+            minimum_navel_boundary_margin_ratio_review=max(
+                0.0, args.minimum_navel_boundary_margin_ratio_review
+            ),
         )
 
         cv2.imwrite(
@@ -491,11 +576,7 @@ def main() -> None:
                 "navel_confidence": anatomy.navel_confidence,
                 "abdomen_confidence": anatomy.abdomen_confidence,
                 "abdomen_polygon": [[x, y] for x, y in anatomy.abdomen_polygon],
-                "validation_metrics": {
-                    "abdomen_area_ratio": validation.abdomen_area_ratio,
-                    "brightness_mean": validation.brightness_mean,
-                    "contrast_std": validation.contrast_std,
-                },
+                "validation_metrics": validation.metrics,
                 **empty_quadrant_detail(),
                 "total_score": None,
             }
@@ -512,9 +593,7 @@ def main() -> None:
                     "navel_y": navel_y,
                     "navel_confidence": round(anatomy.navel_confidence, 6),
                     "abdomen_confidence": round(anatomy.abdomen_confidence, 6),
-                    "abdomen_area_ratio": round(validation.abdomen_area_ratio, 6),
-                    "brightness_mean": round(validation.brightness_mean, 3),
-                    "contrast_std": round(validation.contrast_std, 3),
+                    **validation_summary_fields(validation),
                     **empty_quadrant_row(),
                     "total_score": None,
                 }
@@ -635,11 +714,7 @@ def main() -> None:
             "navel_confidence": anatomy.navel_confidence,
             "abdomen_confidence": anatomy.abdomen_confidence,
             "abdomen_polygon": [[x, y] for x, y in anatomy.abdomen_polygon],
-            "validation_metrics": {
-                "abdomen_area_ratio": validation.abdomen_area_ratio,
-                "brightness_mean": validation.brightness_mean,
-                "contrast_std": validation.contrast_std,
-            },
+            "validation_metrics": validation.metrics,
             "left_upper": {
                 "count": quadrant_results["left_upper"].count,
                 "score": quadrant_results["left_upper"].score,
@@ -672,9 +747,7 @@ def main() -> None:
                 "navel_y": navel_y,
                 "navel_confidence": round(anatomy.navel_confidence, 6),
                 "abdomen_confidence": round(anatomy.abdomen_confidence, 6),
-                "abdomen_area_ratio": round(validation.abdomen_area_ratio, 6),
-                "brightness_mean": round(validation.brightness_mean, 3),
-                "contrast_std": round(validation.contrast_std, 3),
+                **validation_summary_fields(validation),
                 "left_upper_count": quadrant_results["left_upper"].count,
                 "left_upper_score": quadrant_results["left_upper"].score,
                 "right_upper_count": quadrant_results["right_upper"].count,

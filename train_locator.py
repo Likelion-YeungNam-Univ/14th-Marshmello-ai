@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import json
 from pathlib import Path
 
 import torch
@@ -15,6 +16,7 @@ from locator_core import (
     set_seed,
 )
 from locator_settings import (
+    ABDOMEN_THRESHOLD,
     BATCH_SIZE,
     EARLY_STOPPING_PATIENCE,
     ENCODER_NAME,
@@ -23,6 +25,7 @@ from locator_settings import (
     LEARNING_RATE,
     LOCATOR_CHECKPOINT_DIR,
     LOCATOR_CHECKPOINT_PATH,
+    LOCATOR_DATASET_DIR,
     LOCATOR_OUTPUT_DIR,
     LOCATOR_TRAIN_ABDOMEN_DIR,
     LOCATOR_TRAIN_IMAGE_DIR,
@@ -30,11 +33,34 @@ from locator_settings import (
     LOCATOR_VAL_ABDOMEN_DIR,
     LOCATOR_VAL_IMAGE_DIR,
     LOCATOR_VAL_NAVEL_DIR,
+    LOCATOR_VERSION,
+    NAVEL_GAUSSIAN_SIGMA_RATIO,
+    NAVEL_HEATMAP_POS_WEIGHT,
     NAVEL_LOSS_WEIGHT,
+    NAVEL_TARGET_TYPE,
     NUM_WORKERS,
     USE_IMAGENET_WEIGHTS,
     WEIGHT_DECAY,
 )
+
+
+def verify_dataset_version() -> None:
+    metadata_path = LOCATOR_DATASET_DIR / "dataset_metadata.json"
+    if not metadata_path.exists():
+        raise RuntimeError(
+            "locator v2 dataset metadata가 없습니다.\n"
+            "기존 원형 배꼽 mask를 그대로 학습하지 말고 다음을 먼저 실행하세요:\n"
+            "  python prepare_locator_dataset.py --overwrite"
+        )
+    with metadata_path.open("r", encoding="utf-8") as file:
+        metadata = json.load(file)
+    target_type = str(metadata.get("navel_target_type", ""))
+    if target_type != NAVEL_TARGET_TYPE:
+        raise RuntimeError(
+            f"배꼽 target 형식이 다릅니다: {target_type!r}\n"
+            f"필요 형식: {NAVEL_TARGET_TYPE!r}\n"
+            "python prepare_locator_dataset.py --overwrite 를 실행하세요."
+        )
 
 
 def run_epoch(
@@ -52,13 +78,13 @@ def run_epoch(
         "abdomen_dice": 0.0,
         "navel_distance_px": 0.0,
         "navel_distance_normalized": 0.0,
+        "navel_peak_confidence": 0.0,
     }
     batches = 0
-
     progress = tqdm(loader, desc="Train" if training else "Validation")
     for images, targets, _names in progress:
-        images = images.to(device)
-        targets = targets.to(device)
+        images = images.to(device, non_blocking=True)
+        targets = targets.to(device, non_blocking=True)
 
         if training:
             optimizer.zero_grad(set_to_none=True)
@@ -68,6 +94,7 @@ def run_epoch(
             loss = loss_function(logits, targets)
             if training:
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
                 optimizer.step()
 
         metrics = locator_metrics(logits.detach(), targets)
@@ -84,11 +111,13 @@ def run_epoch(
 
     if batches == 0:
         raise RuntimeError("데이터 배치가 없습니다.")
-
-    return total_loss / batches, {key: value / batches for key, value in metric_sums.items()}
+    return total_loss / batches, {
+        key: value / batches for key, value in metric_sums.items()
+    }
 
 
 def main() -> None:
+    verify_dataset_version()
     set_seed()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -106,7 +135,6 @@ def main() -> None:
         train=False,
         image_size=IMAGE_SIZE,
     )
-
     train_loader = DataLoader(
         train_dataset,
         batch_size=BATCH_SIZE,
@@ -126,11 +154,21 @@ def main() -> None:
         encoder_name=ENCODER_NAME,
         use_imagenet_weights=USE_IMAGENET_WEIGHTS,
     ).to(device)
-    loss_function = AnatomyLoss(navel_weight=NAVEL_LOSS_WEIGHT)
+    loss_function = AnatomyLoss(
+        navel_weight=NAVEL_LOSS_WEIGHT,
+        navel_positive_weight=NAVEL_HEATMAP_POS_WEIGHT,
+    )
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=LEARNING_RATE,
         weight_decay=WEIGHT_DECAY,
+    )
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=0.5,
+        patience=5,
+        min_lr=1e-6,
     )
 
     LOCATOR_CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
@@ -138,14 +176,15 @@ def main() -> None:
     history_dir.mkdir(parents=True, exist_ok=True)
     history_path = history_dir / "history.csv"
 
-    print("=" * 64)
-    print("복부 영역 + 배꼽 위치 자동 모델 학습")
+    print("=" * 68)
+    print("복부 영역 + 배꼽 Gaussian heatmap locator v2 학습")
     print(f"장치: {device}")
     print(f"Train: {len(train_dataset)}장")
     print(f"Validation: {len(val_dataset)}장")
-    print("모델 출력 0번 채널: 복부 영역")
-    print("모델 출력 1번 채널: 배꼽 주변 원형 마스크")
-    print("=" * 64)
+    print("모델 출력 0번 채널: 복부 binary segmentation")
+    print("모델 출력 1번 채널: 배꼽 Gaussian heatmap")
+    print("augmentation: flip + affine + perspective + brightness/gamma/blur")
+    print("=" * 68)
 
     best_val_loss = float("inf")
     no_improvement = 0
@@ -159,6 +198,8 @@ def main() -> None:
         val_loss, val_metrics = run_epoch(
             model, val_loader, loss_function, device, optimizer=None
         )
+        scheduler.step(val_loss)
+        current_lr = float(optimizer.param_groups[0]["lr"])
 
         print(
             f"train loss={train_loss:.4f}, abdomen dice={train_metrics['abdomen_dice']:.4f}, "
@@ -166,18 +207,22 @@ def main() -> None:
         )
         print(
             f"val   loss={val_loss:.4f}, abdomen dice={val_metrics['abdomen_dice']:.4f}, "
-            f"navel distance={val_metrics['navel_distance_px']:.1f}px"
+            f"navel distance={val_metrics['navel_distance_px']:.1f}px, lr={current_lr:.2e}"
         )
-
         history_rows.append(
             {
                 "epoch": epoch,
+                "learning_rate": current_lr,
                 "train_loss": train_loss,
                 "val_loss": val_loss,
                 "train_abdomen_dice": train_metrics["abdomen_dice"],
                 "val_abdomen_dice": val_metrics["abdomen_dice"],
                 "train_navel_distance_px": train_metrics["navel_distance_px"],
                 "val_navel_distance_px": val_metrics["navel_distance_px"],
+                "train_navel_distance_normalized": train_metrics["navel_distance_normalized"],
+                "val_navel_distance_normalized": val_metrics["navel_distance_normalized"],
+                "train_navel_peak_confidence": train_metrics["navel_peak_confidence"],
+                "val_navel_peak_confidence": val_metrics["navel_peak_confidence"],
             }
         )
 
@@ -187,16 +232,22 @@ def main() -> None:
             torch.save(
                 {
                     "model_state_dict": model.state_dict(),
+                    "locator_version": LOCATOR_VERSION,
+                    "navel_target_type": NAVEL_TARGET_TYPE,
+                    "navel_gaussian_sigma_ratio": NAVEL_GAUSSIAN_SIGMA_RATIO,
                     "image_size": IMAGE_SIZE,
                     "encoder_name": ENCODER_NAME,
-                    "abdomen_threshold": 0.5,
+                    "abdomen_threshold": ABDOMEN_THRESHOLD,
                     "best_val_loss": best_val_loss,
                     "val_abdomen_dice": val_metrics["abdomen_dice"],
                     "val_navel_distance_px": val_metrics["navel_distance_px"],
+                    "val_navel_distance_normalized": val_metrics[
+                        "navel_distance_normalized"
+                    ],
                 },
                 LOCATOR_CHECKPOINT_PATH,
             )
-            print(f"최고 모델 저장: {LOCATOR_CHECKPOINT_PATH}")
+            print(f"최고 locator v2 모델 저장: {LOCATOR_CHECKPOINT_PATH}")
         else:
             no_improvement += 1
 
