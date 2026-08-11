@@ -1,0 +1,16 @@
+# Install PyTorch / torchvision for your CPU or CUDA environment first.
+# Keep segmentation_models_pytorch aligned with the training repository.
+segmentation-models-pytorch==0.5.0
+opencv-python
+numpy
+
+#model_test/
+#├── standalone_unet_predict.py
+#├── requirements_standalone.txt
+#├── best_unet.pt
+#└── test.jpg
+
+#python standalone_unet_predict.py \
+# --model best_unet.pt \
+# --input test.jpg \
+# --output result
