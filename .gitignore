@@ -14,7 +14,7 @@ dataset_backup_before_split_*/
 locator_dataset/
 new_images/
 test_images/
-
+model_test/
 
 abdomen_rois.json
 navel_points.csv
@@ -26,6 +26,8 @@ outputs/
 checkpoints/*.pt
 checkpoints/*.pth
 checkpoints/*.ckpt
+checkpoints/*.onnx
+checkpoints/*.data
 !checkpoints/.gitkeep
 
 
